@@ -2176,7 +2176,7 @@ class DeformableDetrForObjectDetection(DeformableDetrPreTrainedModel):
     DEFORMABLE_DETR_START_DOCSTRING,
 )
 
-class DetrForSegmentation(DeformableDetrPreTrainedModel):
+class DeformableDetrForSegmentation(DeformableDetrPreTrainedModel):
     def __init__(self, config: DeformableDetrConfig):
         super().__init__(config)
 
