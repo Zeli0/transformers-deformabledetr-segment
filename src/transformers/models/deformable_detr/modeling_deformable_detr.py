@@ -48,6 +48,7 @@ from ...pytorch_utils import meshgrid
 from ...utils import is_accelerate_available, is_ninja_available, logging
 from ...utils.backbone_utils import load_backbone
 from .configuration_deformable_detr import DeformableDetrConfig
+from ..detr.modeling_detr import DetrMaskHeadSmallConv, DetrMHAttentionMap
 
 
 logger = logging.get_logger(__name__)
@@ -2166,7 +2167,244 @@ class DeformableDetrForObjectDetection(DeformableDetrPreTrainedModel):
         )
 
         return dict_outputs
+@add_start_docstrings(
+    """
+    DETR Model (consisting of a backbone and encoder-decoder Transformer) with a segmentation head on top, for tasks
+    such as COCO panoptic.
 
+    """,
+    DEFORMABLE_DETR_START_DOCSTRING,
+)
+
+class DetrForSegmentation(DeformableDetrPreTrainedModel):
+    def __init__(self, config: DeformableDetrConfig):
+        super().__init__(config)
+
+        # object detection model
+        self.detr = DeformableDetrForObjectDetection(config)
+
+        # segmentation head
+        hidden_size, number_of_heads = config.d_model, config.encoder_attention_heads
+        intermediate_channel_sizes = self.detr.model.backbone.conv_encoder.intermediate_channel_sizes
+
+        self.mask_head = DetrMaskHeadSmallConv(
+            hidden_size + number_of_heads, intermediate_channel_sizes[::-1][-3:], hidden_size
+        )
+
+        self.bbox_attention = DetrMHAttentionMap(
+            hidden_size, hidden_size, number_of_heads, dropout=0.0, std=config.init_xavier_std
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(DEFORMABLE_DETR_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=DeformableDetrSegmentationOutput, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        pixel_values: torch.FloatTensor,
+        pixel_mask: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.FloatTensor] = None,
+        encoder_outputs: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[List[dict]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.FloatTensor], DeformableDetrSegmentationOutput]:
+        r"""
+        labels (`List[Dict]` of len `(batch_size,)`, *optional*):
+            Labels for computing the bipartite matching loss, DICE/F-1 loss and Focal loss. List of dicts, each
+            dictionary containing at least the following 3 keys: 'class_labels', 'boxes' and 'masks' (the class labels,
+            bounding boxes and segmentation masks of an image in the batch respectively). The class labels themselves
+            should be a `torch.LongTensor` of len `(number of bounding boxes in the image,)`, the boxes a
+            `torch.FloatTensor` of shape `(number of bounding boxes in the image, 4)` and the masks a
+            `torch.FloatTensor` of shape `(number of bounding boxes in the image, height, width)`.
+
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> import io
+        >>> import requests
+        >>> from PIL import Image
+        >>> import torch
+        >>> import numpy
+
+        >>> from transformers import AutoImageProcessor, DetrForSegmentation
+        >>> from transformers.image_transforms import rgb_to_id
+
+        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> image_processor = AutoImageProcessor.from_pretrained("facebook/detr-resnet-50-panoptic")
+        >>> model = DetrForSegmentation.from_pretrained("facebook/detr-resnet-50-panoptic")
+
+        >>> # prepare image for the model
+        >>> inputs = image_processor(images=image, return_tensors="pt")
+
+        >>> # forward pass
+        >>> outputs = model(**inputs)
+
+        >>> # Use the `post_process_panoptic_segmentation` method of the `image_processor` to retrieve post-processed panoptic segmentation maps
+        >>> # Segmentation results are returned as a list of dictionaries
+        >>> result = image_processor.post_process_panoptic_segmentation(outputs, target_sizes=[(300, 500)])
+
+        >>> # A tensor of shape (height, width) where each value denotes a segment id, filled with -1 if no segment is found
+        >>> panoptic_seg = result[0]["segmentation"]
+        >>> # Get prediction score and segment_id to class_id mapping of each segment
+        >>> panoptic_segments_info = result[0]["segments_info"]
+        ```"""
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        batch_size, num_channels, height, width = pixel_values.shape
+        device = pixel_values.device
+
+        if pixel_mask is None:
+            pixel_mask = torch.ones((batch_size, height, width), device=device)
+
+        # First, get list of feature maps and position embeddings
+        features, object_queries_list = self.detr.model.backbone(pixel_values, pixel_mask=pixel_mask)
+
+        # Second, apply 1x1 convolution to reduce the channel dimension to d_model (256 by default)
+        feature_map, mask = features[-1]
+        batch_size, num_channels, height, width = feature_map.shape
+        projected_feature_map = self.detr.model.input_projection(feature_map)
+
+        # Third, flatten the feature map + position embeddings of shape NxCxHxW to NxCxHW, and permute it to NxHWxC
+        # In other words, turn their shape into (batch_size, sequence_length, hidden_size)
+        flattened_features = projected_feature_map.flatten(2).permute(0, 2, 1)
+        object_queries = object_queries_list[-1].flatten(2).permute(0, 2, 1)
+
+        flattened_mask = mask.flatten(1)
+
+        # Fourth, sent flattened_features + flattened_mask + position embeddings through encoder
+        # flattened_features is a Tensor of shape (batch_size, heigth*width, hidden_size)
+        # flattened_mask is a Tensor of shape (batch_size, heigth*width)
+        if encoder_outputs is None:
+            encoder_outputs = self.detr.model.encoder(
+                inputs_embeds=flattened_features,
+                attention_mask=flattened_mask,
+                object_queries=object_queries,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+            )
+
+        # Fifth, sent query embeddings + position embeddings through the decoder (which is conditioned on the encoder output)
+        query_position_embeddings = self.detr.model.query_position_embeddings.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1
+        )
+        queries = torch.zeros_like(query_position_embeddings)
+
+        # decoder outputs consists of (dec_features, dec_hidden, dec_attn)
+        decoder_outputs = self.detr.model.decoder(
+            inputs_embeds=queries,
+            attention_mask=None,
+            object_queries=object_queries,
+            query_position_embeddings=query_position_embeddings,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=flattened_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = decoder_outputs[0]
+
+        # Sixth, compute logits, pred_boxes and pred_masks
+        logits = self.detr.class_labels_classifier(sequence_output)
+        pred_boxes = self.detr.bbox_predictor(sequence_output).sigmoid()
+
+        memory = encoder_outputs[0].permute(0, 2, 1).view(batch_size, self.config.d_model, height, width)
+        mask = flattened_mask.view(batch_size, height, width)
+
+        # FIXME h_boxes takes the last one computed, keep this in mind
+        # important: we need to reverse the mask, since in the original implementation the mask works reversed
+        # bbox_mask is of shape (batch_size, num_queries, number_of_attention_heads in bbox_attention, height/32, width/32)
+        bbox_mask = self.bbox_attention(sequence_output, memory, mask=~mask)
+
+        seg_masks = self.mask_head(projected_feature_map, bbox_mask, [features[2][0], features[1][0], features[0][0]])
+
+        pred_masks = seg_masks.view(batch_size, self.detr.config.num_queries, seg_masks.shape[-2], seg_masks.shape[-1])
+
+        loss, loss_dict, auxiliary_outputs = None, None, None
+        if labels is not None:
+            # First: create the matcher
+            matcher = DeformableDetrHungarianMatcher(
+                class_cost=self.config.class_cost, bbox_cost=self.config.bbox_cost, giou_cost=self.config.giou_cost
+            )
+            # Second: create the criterion
+            losses = ["labels", "boxes", "cardinality", "masks"]
+            criterion = DeformableDetrLoss(
+                matcher=matcher,
+                num_classes=self.config.num_labels,
+                focal_alpha=self.config.focal_alpha,
+                losses=losses,
+            )
+            criterion.to(self.device)
+            # Third: compute the losses, based on outputs and labels
+            outputs_loss = {}
+            outputs_loss["logits"] = logits
+            outputs_loss["pred_boxes"] = pred_boxes
+            outputs_loss["pred_masks"] = pred_masks
+            if self.config.auxiliary_loss:
+                intermediate = decoder_outputs.intermediate_hidden_states if return_dict else decoder_outputs[-1]
+                outputs_class = self.detr.class_labels_classifier(intermediate)
+                outputs_coord = self.detr.bbox_predictor(intermediate).sigmoid()
+                auxiliary_outputs = self.detr._set_aux_loss(outputs_class, outputs_coord)
+                outputs_loss["auxiliary_outputs"] = auxiliary_outputs
+
+            loss_dict = criterion(outputs_loss, labels)
+            # Fourth: compute total loss, as a weighted sum of the various losses
+            weight_dict = {"loss_ce": 1, "loss_bbox": self.config.bbox_loss_coefficient}
+            weight_dict["loss_giou"] = self.config.giou_loss_coefficient
+            weight_dict["loss_mask"] = self.config.mask_loss_coefficient
+            weight_dict["loss_dice"] = self.config.dice_loss_coefficient
+            if self.config.auxiliary_loss:
+                aux_weight_dict = {}
+                for i in range(self.config.decoder_layers - 1):
+                    aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+                weight_dict.update(aux_weight_dict)
+            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+
+        if not return_dict:
+            if auxiliary_outputs is not None:
+                output = (logits, pred_boxes, pred_masks) + auxiliary_outputs + decoder_outputs + encoder_outputs
+            else:
+                output = (logits, pred_boxes, pred_masks) + decoder_outputs + encoder_outputs
+            return ((loss, loss_dict) + output) if loss is not None else output
+
+        return DeformableDetrSegmentationOutput(
+            loss=loss,
+            loss_dict=loss_dict,
+            logits=logits,
+            pred_boxes=pred_boxes,
+            pred_masks=pred_masks,
+            auxiliary_outputs=auxiliary_outputs,
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+            intermediate_hidden_states=decoder_outputs.intermediate_hidden_states,
+            intermediate_reference_points=decoder_outputs.intermediate_reference_points,
+            init_reference_points=decoder_outputs.init_reference_points,
+            enc_outputs_class=decoder_outputs.enc_outputs_class,
+            enc_outputs_coord_logits=decoder_outputs.enc_outputs_coord_logits,
+        )
 
 # Copied from transformers.models.detr.modeling_detr.dice_loss
 def dice_loss(inputs, targets, num_boxes):
